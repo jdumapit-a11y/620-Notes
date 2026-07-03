@@ -1,0 +1,18 @@
+{
+  "name": "620-notes-backend",
+  "version": "1.0.0",
+  "description": "Backend for the 620 Notes nightly comms board — stores notes and auto-sends a nightly email digest.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
