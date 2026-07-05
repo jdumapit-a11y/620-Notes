@@ -7,7 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '20mb' })); // photos, base64-encoded, need real headroom over the 100kb default
 
 const DATA_DIR = path.join(__dirname, 'data');
 const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
@@ -222,8 +222,9 @@ async function extractReservationsFromImage(imageBase64, mediaType) {
             type: 'text',
             text: 'Extract every reservation visible in this restaurant reservations screenshot. ' +
               'Return ONLY a JSON array, no prose, no markdown code fences. Each item: ' +
-              '{"time": string, "name": string, "partySize": number or null, "notes": string}. ' +
-              'Put allergy info, dietary restrictions, special occasions, and seating requests into "notes". ' +
+              '{"time": string, "name": string, "partySize": number or null, "allergies": string, "specialInfo": string}. ' +
+              '"allergies" is ONLY food allergies and dietary restrictions (e.g. "peanut allergy", "gluten-free", "vegan"). ' +
+              '"specialInfo" is everything else worth knowing — special occasions, seating requests, VIP notes, server requests, etc. ' +
               'Use "" or null for anything not visible. Return [] if no reservations are visible.'
           }
         ]
@@ -269,7 +270,8 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
       time: r.time || '',
       name: r.name || '',
       partySize: typeof r.partySize === 'number' ? r.partySize : null,
-      notes: r.notes || '',
+      allergies: r.allergies || '',
+      specialInfo: r.specialInfo || '',
       uploadedBy: req.user.name,
       uploadedAt: new Date().toISOString()
     }));
@@ -280,6 +282,21 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Any signed-in staff can correct or add allergy/special-info details as
+// they learn them through the shift — this isn't gated to managers since
+// it's just editing text, not triggering a paid API call.
+app.patch('/api/reservations/:id', authenticate, (req, res) => {
+  const current = readReservations();
+  const reservation = current.reservations.find(r => r.id === req.params.id);
+  if (!reservation) return res.status(404).json({ error: 'Reservation not found (it may have rolled over to a new day).' });
+
+  if (typeof req.body.allergies === 'string') reservation.allergies = req.body.allergies.slice(0, 300);
+  if (typeof req.body.specialInfo === 'string') reservation.specialInfo = req.body.specialInfo.slice(0, 300);
+
+  writeJSON(RESERVATIONS_FILE, current);
+  res.json(reservation);
 });
 
 app.delete('/api/reservations', authenticate, requireRole('admin'), (req, res) => {
