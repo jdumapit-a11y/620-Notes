@@ -222,12 +222,15 @@ async function extractReservationsFromImage(imageBase64, mediaType) {
             type: 'text',
             text: 'Extract every reservation visible in this restaurant reservations screenshot (from OpenTable). ' +
               'Return ONLY a JSON array, no prose, no markdown code fences. Each item: ' +
-              '{"time": string, "partySize": number or null, "name": string, "generalNotes": string, "specialEvents": string, "foodDrinkPreferences": string}. ' +
-              'Map fields the same way OpenTable itself categorizes them: ' +
+              '{"time": string, "partySize": number or null, "name": string, "specialEvents": string, "foodDrinkPreferences": string}. ' +
               '"name" is the guest\'s name. ' +
-              '"generalNotes" is general guest notes not covered by the other fields (seating requests, server notes, VIP status, etc). ' +
               '"specialEvents" is occasions like birthdays, anniversaries, celebrations. ' +
               '"foodDrinkPreferences" is dietary restrictions, allergies, and food/drink preferences. ' +
+              'OpenTable often has a general "notes" field mixing several kinds of information together. ' +
+              'Read that field carefully: if it contains any food allergy or dietary restriction, fold that ' +
+              'specific detail into "foodDrinkPreferences" (do not repeat it if something equivalent is already ' +
+              'there). Discard everything else from general notes — seating requests, server notes, VIP status, ' +
+              'and any other non-food-related content should NOT appear anywhere in the output. ' +
               'Use "" or null for anything not visible. Return [] if no reservations are visible.'
           }
         ]
@@ -273,7 +276,6 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
       time: r.time || '',
       partySize: typeof r.partySize === 'number' ? r.partySize : null,
       name: r.name || '',
-      generalNotes: r.generalNotes || '',
       specialEvents: r.specialEvents || '',
       foodDrinkPreferences: r.foodDrinkPreferences || '',
       uploadedBy: req.user.name,
@@ -296,7 +298,7 @@ app.patch('/api/reservations/:id', authenticate, (req, res) => {
   const reservation = current.reservations.find(r => r.id === req.params.id);
   if (!reservation) return res.status(404).json({ error: 'Reservation not found (it may have rolled over to a new day).' });
 
-  const editableFields = ['name', 'generalNotes', 'specialEvents', 'foodDrinkPreferences'];
+  const editableFields = ['name', 'specialEvents', 'foodDrinkPreferences'];
   editableFields.forEach(field => {
     if (typeof req.body[field] === 'string') reservation[field] = req.body[field].slice(0, 300);
   });
