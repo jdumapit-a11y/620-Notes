@@ -220,11 +220,14 @@ async function extractReservationsFromImage(imageBase64, mediaType) {
           { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
           {
             type: 'text',
-            text: 'Extract every reservation visible in this restaurant reservations screenshot. ' +
+            text: 'Extract every reservation visible in this restaurant reservations screenshot (from OpenTable). ' +
               'Return ONLY a JSON array, no prose, no markdown code fences. Each item: ' +
-              '{"time": string, "name": string, "partySize": number or null, "allergies": string, "specialInfo": string}. ' +
-              '"allergies" is ONLY food allergies and dietary restrictions (e.g. "peanut allergy", "gluten-free", "vegan"). ' +
-              '"specialInfo" is everything else worth knowing — special occasions, seating requests, VIP notes, server requests, etc. ' +
+              '{"time": string, "partySize": number or null, "name": string, "generalNotes": string, "specialEvents": string, "foodDrinkPreferences": string}. ' +
+              'Map fields the same way OpenTable itself categorizes them: ' +
+              '"name" is the guest\'s name. ' +
+              '"generalNotes" is general guest notes not covered by the other fields (seating requests, server notes, VIP status, etc). ' +
+              '"specialEvents" is occasions like birthdays, anniversaries, celebrations. ' +
+              '"foodDrinkPreferences" is dietary restrictions, allergies, and food/drink preferences. ' +
               'Use "" or null for anything not visible. Return [] if no reservations are visible.'
           }
         ]
@@ -268,10 +271,11 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
     const withMeta = extracted.map(r => ({
       id: 'r' + Date.now() + Math.random().toString(36).slice(2, 7),
       time: r.time || '',
-      name: r.name || '',
       partySize: typeof r.partySize === 'number' ? r.partySize : null,
-      allergies: r.allergies || '',
-      specialInfo: r.specialInfo || '',
+      name: r.name || '',
+      generalNotes: r.generalNotes || '',
+      specialEvents: r.specialEvents || '',
+      foodDrinkPreferences: r.foodDrinkPreferences || '',
       uploadedBy: req.user.name,
       uploadedAt: new Date().toISOString()
     }));
@@ -284,16 +288,18 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
   }
 });
 
-// Any signed-in staff can correct or add allergy/special-info details as
-// they learn them through the shift — this isn't gated to managers since
-// it's just editing text, not triggering a paid API call.
+// Any signed-in staff can correct or add details as they learn them through
+// the shift — this isn't gated to managers since it's just editing text,
+// not triggering a paid API call.
 app.patch('/api/reservations/:id', authenticate, (req, res) => {
   const current = readReservations();
   const reservation = current.reservations.find(r => r.id === req.params.id);
   if (!reservation) return res.status(404).json({ error: 'Reservation not found (it may have rolled over to a new day).' });
 
-  if (typeof req.body.allergies === 'string') reservation.allergies = req.body.allergies.slice(0, 300);
-  if (typeof req.body.specialInfo === 'string') reservation.specialInfo = req.body.specialInfo.slice(0, 300);
+  const editableFields = ['name', 'generalNotes', 'specialEvents', 'foodDrinkPreferences'];
+  editableFields.forEach(field => {
+    if (typeof req.body[field] === 'string') reservation[field] = req.body[field].slice(0, 300);
+  });
 
   writeJSON(RESERVATIONS_FILE, current);
   res.json(reservation);
