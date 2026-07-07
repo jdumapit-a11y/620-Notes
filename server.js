@@ -25,6 +25,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const FROM_EMAIL = process.env.FROM_EMAIL || 'onboarding@resend.dev';
+const FROM_NAME = process.env.FROM_NAME || '620 Notes';
 const DIGEST_CRON = process.env.DIGEST_CRON || '0 0 * * *'; // default: midnight daily
 const TZ = process.env.TZ || 'America/New_York';
 const CLEAR_AFTER_SEND = (process.env.CLEAR_AFTER_SEND || 'true').toLowerCase() === 'true';
@@ -482,7 +483,7 @@ async function sendViaResend(to, subject, html, text) {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      from: FROM_EMAIL,
+      from: `${FROM_NAME} <${FROM_EMAIL}>`,
       to: [to],
       subject,
       html,
