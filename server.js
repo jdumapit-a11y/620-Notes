@@ -13,6 +13,9 @@ const DATA_DIR = path.join(__dirname, 'data');
 const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const RESERVATIONS_FILE = path.join(DATA_DIR, 'reservations.json');
+const SHARED_FILES_FILE = path.join(DATA_DIR, 'shared-files.json');
+
+const ATTACHMENTS_BUCKET = 'attachments';
 
 const CATEGORIES = ['General', 'Repairs and Maintenance', 'Service', 'Food and Beverage', 'Upcoming Events'];
 const ROLE_RANK = { staff: 1, manager: 2, admin: 3 };
@@ -39,6 +42,7 @@ if (!fs.existsSync(NOTES_FILE)) fs.writeFileSync(NOTES_FILE, '[]');
 if (!fs.existsSync(SETTINGS_FILE)) {
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ boardTitle: '620 NOTES' }, null, 2));
 }
+if (!fs.existsSync(SHARED_FILES_FILE)) fs.writeFileSync(SHARED_FILES_FILE, '[]');
 
 function readJSON(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -121,7 +125,7 @@ app.get('/api/notes', authenticate, (req, res) => {
 });
 
 app.post('/api/notes', authenticate, (req, res) => {
-  const { category, tag, message } = req.body || {};
+  const { category, tag, message, attachmentPath, attachmentName } = req.body || {};
   if (!message || !CATEGORIES.includes(category)) {
     return res.status(400).json({ error: 'message and a valid category are required.' });
   }
@@ -134,6 +138,8 @@ app.post('/api/notes', authenticate, (req, res) => {
     tag: tag || 'Note',
     message: String(message).slice(0, 1000),
     pinned: false,
+    attachmentPath: attachmentPath || null,
+    attachmentName: attachmentName ? String(attachmentName).slice(0, 200) : null,
     ts: new Date().toISOString()
   };
   notes.push(note);
@@ -154,7 +160,7 @@ app.patch('/api/notes/:id', authenticate, requireRole('manager'), (req, res) => 
 });
 
 // Staff can delete their own notes; managers/admins can delete anyone's.
-app.delete('/api/notes/:id', authenticate, (req, res) => {
+app.delete('/api/notes/:id', authenticate, async (req, res) => {
   const notes = readJSON(NOTES_FILE, []);
   const note = notes.find(n => n.id === req.params.id);
   if (!note) return res.status(404).json({ error: 'Note not found.' });
@@ -163,6 +169,10 @@ app.delete('/api/notes/:id', authenticate, (req, res) => {
   const canModerate = (ROLE_RANK[req.user.role] || 0) >= ROLE_RANK.manager;
   if (!isOwnNote && !canModerate) {
     return res.status(403).json({ error: 'You can only delete your own notes.' });
+  }
+
+  if (note.attachmentPath) {
+    await supabaseAdmin.storage.from(ATTACHMENTS_BUCKET).remove([note.attachmentPath]).catch(() => {});
   }
 
   writeJSON(NOTES_FILE, notes.filter(n => n.id !== req.params.id));
@@ -311,6 +321,51 @@ app.delete('/api/reservations', authenticate, requireRole('admin'), (req, res) =
   const cleared = { date: todayStr(), reservations: [] };
   writeJSON(RESERVATIONS_FILE, cleared);
   res.json(cleared);
+});
+
+// ---- Shared Files (general attachments area, separate from notes) ----
+// The board uploads the actual bytes straight to Supabase Storage from the
+// browser (using the signed-in user's own session) — this backend only
+// tracks the metadata, so large files never pass through this server.
+app.get('/api/files', authenticate, (req, res) => {
+  res.json(readJSON(SHARED_FILES_FILE, []));
+});
+
+app.post('/api/files', authenticate, (req, res) => {
+  const { path: filePath, filename, size } = req.body || {};
+  if (!filePath || !filename) {
+    return res.status(400).json({ error: 'path and filename are required.' });
+  }
+  const files = readJSON(SHARED_FILES_FILE, []);
+  const file = {
+    id: 'f' + Date.now() + Math.random().toString(36).slice(2, 7),
+    path: filePath,
+    filename: String(filename).slice(0, 200),
+    size: typeof size === 'number' ? size : null,
+    uploadedById: req.user.id,
+    uploadedBy: req.user.name,
+    uploadedAt: new Date().toISOString()
+  };
+  files.push(file);
+  writeJSON(SHARED_FILES_FILE, files);
+  res.status(201).json(file);
+});
+
+// Uploader can remove their own file; managers/admins can remove anyone's.
+app.delete('/api/files/:id', authenticate, async (req, res) => {
+  const files = readJSON(SHARED_FILES_FILE, []);
+  const file = files.find(f => f.id === req.params.id);
+  if (!file) return res.status(404).json({ error: 'File not found.' });
+
+  const isOwnFile = file.uploadedById === req.user.id;
+  const canModerate = (ROLE_RANK[req.user.role] || 0) >= ROLE_RANK.manager;
+  if (!isOwnFile && !canModerate) {
+    return res.status(403).json({ error: 'You can only remove files you uploaded.' });
+  }
+
+  await supabaseAdmin.storage.from(ATTACHMENTS_BUCKET).remove([file.path]).catch(() => {});
+  writeJSON(SHARED_FILES_FILE, files.filter(f => f.id !== req.params.id));
+  res.json({ ok: true });
 });
 
 // ---- Digest building + sending ----
