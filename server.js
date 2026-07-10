@@ -139,6 +139,9 @@ app.post('/api/notes', authenticate, (req, res) => {
     tag: tag || 'Note',
     message: String(message).slice(0, 1000),
     pinned: false,
+    archived: false,
+    likes: [],
+    replies: [],
     attachmentPath: attachmentPath || null,
     attachmentName: attachmentName ? String(attachmentName).slice(0, 200) : null,
     ts: new Date().toISOString()
@@ -148,7 +151,7 @@ app.post('/api/notes', authenticate, (req, res) => {
   res.status(201).json(note);
 });
 
-// Pinning is a moderation action — managers and admins only.
+// Pinning and archiving are moderation actions — managers and admins only.
 app.patch('/api/notes/:id', authenticate, requireRole('manager'), (req, res) => {
   const notes = readJSON(NOTES_FILE, []);
   const note = notes.find(n => n.id === req.params.id);
@@ -156,6 +159,65 @@ app.patch('/api/notes/:id', authenticate, requireRole('manager'), (req, res) => 
   if (typeof req.body.pinned === 'boolean') {
     note.pinned = req.body.pinned;
   }
+  if (typeof req.body.archived === 'boolean') {
+    note.archived = req.body.archived;
+  }
+  writeJSON(NOTES_FILE, notes);
+  res.json(note);
+});
+
+// Anyone signed in can like/unlike — a simple toggle, one like per person.
+app.post('/api/notes/:id/like', authenticate, (req, res) => {
+  const notes = readJSON(NOTES_FILE, []);
+  const note = notes.find(n => n.id === req.params.id);
+  if (!note) return res.status(404).json({ error: 'Note not found.' });
+  if (!Array.isArray(note.likes)) note.likes = [];
+
+  const idx = note.likes.indexOf(req.user.id);
+  if (idx === -1) note.likes.push(req.user.id);
+  else note.likes.splice(idx, 1);
+
+  writeJSON(NOTES_FILE, notes);
+  res.json(note);
+});
+
+// Anyone signed in can reply — same posting rule as notes themselves.
+app.post('/api/notes/:id/replies', authenticate, (req, res) => {
+  const { message } = req.body || {};
+  if (!message || !message.trim()) return res.status(400).json({ error: 'A reply needs a message.' });
+
+  const notes = readJSON(NOTES_FILE, []);
+  const note = notes.find(n => n.id === req.params.id);
+  if (!note) return res.status(404).json({ error: 'Note not found.' });
+  if (!Array.isArray(note.replies)) note.replies = [];
+
+  const reply = {
+    id: 'r' + Date.now() + Math.random().toString(36).slice(2, 7),
+    authorId: req.user.id,
+    author: req.user.name,
+    message: String(message).slice(0, 500),
+    ts: new Date().toISOString()
+  };
+  note.replies.push(reply);
+  writeJSON(NOTES_FILE, notes);
+  res.status(201).json(note);
+});
+
+// Reply author can delete their own; managers/admins can delete anyone's.
+app.delete('/api/notes/:id/replies/:replyId', authenticate, (req, res) => {
+  const notes = readJSON(NOTES_FILE, []);
+  const note = notes.find(n => n.id === req.params.id);
+  if (!note) return res.status(404).json({ error: 'Note not found.' });
+  const reply = (note.replies || []).find(r => r.id === req.params.replyId);
+  if (!reply) return res.status(404).json({ error: 'Reply not found.' });
+
+  const isOwnReply = reply.authorId === req.user.id;
+  const canModerate = (ROLE_RANK[req.user.role] || 0) >= ROLE_RANK.manager;
+  if (!isOwnReply && !canModerate) {
+    return res.status(403).json({ error: 'You can only delete your own replies.' });
+  }
+
+  note.replies = note.replies.filter(r => r.id !== req.params.replyId);
   writeJSON(NOTES_FILE, notes);
   res.json(note);
 });
@@ -233,15 +295,17 @@ async function extractReservationsFromImage(imageBase64, mediaType) {
             type: 'text',
             text: 'Extract every reservation visible in this restaurant reservations screenshot (from OpenTable). ' +
               'Return ONLY a JSON array, no prose, no markdown code fences. Each item: ' +
-              '{"time": string, "partySize": number or null, "name": string, "specialEvents": string, "foodDrinkPreferences": string}. ' +
+              '{"time": string, "partySize": number or null, "name": string, "specialEvents": string, "foodDrinkPreferences": string, "specialRelationship": string}. ' +
               '"name" is the guest\'s name. ' +
               '"specialEvents" is occasions like birthdays, anniversaries, celebrations. ' +
               '"foodDrinkPreferences" is dietary restrictions, allergies, and food/drink preferences. ' +
+              '"specialRelationship" maps to OpenTable\'s own "Special Relationship" guest tag — VIP, employee, ' +
+              'investor, regular, media/press, industry contact, or similar relationship-to-the-restaurant labels. ' +
               'OpenTable often has a general "notes" field mixing several kinds of information together. ' +
               'Read that field carefully: if it contains any food allergy or dietary restriction, fold that ' +
               'specific detail into "foodDrinkPreferences" (do not repeat it if something equivalent is already ' +
-              'there). Discard everything else from general notes — seating requests, server notes, VIP status, ' +
-              'and any other non-food-related content should NOT appear anywhere in the output. ' +
+              'there). Discard everything else from general notes — seating requests, server notes, and any other ' +
+              'content not covered by the fields above should NOT appear anywhere in the output. ' +
               'Use "" or null for anything not visible. Return [] if no reservations are visible.'
           }
         ]
@@ -289,6 +353,7 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
       name: r.name || '',
       specialEvents: r.specialEvents || '',
       foodDrinkPreferences: r.foodDrinkPreferences || '',
+      specialRelationship: r.specialRelationship || '',
       uploadedBy: req.user.name,
       uploadedAt: new Date().toISOString()
     }));
@@ -309,7 +374,7 @@ app.patch('/api/reservations/:id', authenticate, (req, res) => {
   const reservation = current.reservations.find(r => r.id === req.params.id);
   if (!reservation) return res.status(404).json({ error: 'Reservation not found (it may have rolled over to a new day).' });
 
-  const editableFields = ['name', 'specialEvents', 'foodDrinkPreferences'];
+  const editableFields = ['name', 'specialEvents', 'foodDrinkPreferences', 'specialRelationship'];
   editableFields.forEach(field => {
     if (typeof req.body[field] === 'string') reservation[field] = req.body[field].slice(0, 300);
   });
@@ -511,12 +576,13 @@ async function getNotificationRecipients() {
 }
 
 async function runDigest() {
-  const notes = readJSON(NOTES_FILE, []);
+  const allNotes = readJSON(NOTES_FILE, []);
+  const activeNotes = allNotes.filter(n => !n.archived); // archived notes are done — they don't need to keep showing up nightly
   const settings = readJSON(SETTINGS_FILE, { boardTitle: '620 NOTES' });
   const recipients = await getNotificationRecipients();
   const subject = `${settings.boardTitle} — Nightly Digest, ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
-  const html = buildDigestHtml(notes, settings.boardTitle);
-  const text = buildDigestText(notes, settings.boardTitle);
+  const html = buildDigestHtml(activeNotes, settings.boardTitle);
+  const text = buildDigestText(activeNotes, settings.boardTitle);
 
   const results = { sent: [], failed: [] };
   for (const to of recipients) {
@@ -530,9 +596,11 @@ async function runDigest() {
 
   if (results.sent.length > 0 && CLEAR_AFTER_SEND) {
     const archiveFile = path.join(DATA_DIR, `archive-${new Date().toISOString().slice(0, 10)}.json`);
-    writeJSON(archiveFile, notes);
-    // Pinned notes survive the nightly clear — they stay until someone unpins them.
-    writeJSON(NOTES_FILE, notes.filter(n => n.pinned));
+    writeJSON(archiveFile, allNotes);
+    // Pinned and archived notes both survive the nightly clear — pinned
+    // because they're still active and important, archived because they're
+    // a permanent record someone deliberately chose to keep.
+    writeJSON(NOTES_FILE, allNotes.filter(n => n.pinned || n.archived));
   }
 
   console.log(`[digest] sent to ${results.sent.length}, failed for ${results.failed.length}`);
