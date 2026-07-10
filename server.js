@@ -1,19 +1,11 @@
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
-const fs = require('fs');
-const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '20mb' })); // photos, base64-encoded, need real headroom over the 100kb default
-
-const DATA_DIR = path.join(__dirname, 'data');
-const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
-const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
-const RESERVATIONS_FILE = path.join(DATA_DIR, 'reservations.json');
-const SHARED_FILES_FILE = path.join(DATA_DIR, 'shared-files.json');
 
 const ATTACHMENTS_BUCKET = 'attachments';
 
@@ -38,19 +30,37 @@ if (!ANTHROPIC_API_KEY) {
 }
 const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(NOTES_FILE)) fs.writeFileSync(NOTES_FILE, '[]');
-if (!fs.existsSync(SETTINGS_FILE)) {
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ boardTitle: '620 NOTES' }, null, 2));
-}
-if (!fs.existsSync(SHARED_FILES_FILE)) fs.writeFileSync(SHARED_FILES_FILE, '[]');
+// ---- All persistent data lives in Supabase's Postgres database now — see
+// README for the SQL that creates the `notes` and `kv_store` tables. Nothing
+// is stored on the server's own disk anymore, so restarts/redeploys can
+// never lose data the way local JSON files could.
 
-function readJSON(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch (e) { return fallback; }
+function noteRowToApi(row) {
+  return {
+    id: row.id,
+    authorId: row.author_id,
+    author: row.author,
+    category: row.category,
+    tag: row.tag,
+    message: row.message,
+    pinned: row.pinned,
+    archived: row.archived,
+    likes: row.likes || [],
+    replies: row.replies || [],
+    attachmentPath: row.attachment_path,
+    attachmentName: row.attachment_name,
+    ts: row.ts
+  };
 }
-function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+
+async function kvGet(key, fallback) {
+  const { data, error } = await supabaseAdmin.from('kv_store').select('value').eq('key', key).maybeSingle();
+  if (error || !data) return fallback;
+  return data.value;
+}
+async function kvSet(key, value) {
+  const { error } = await supabaseAdmin.from('kv_store').upsert({ key, value, updated_at: new Date().toISOString() });
+  if (error) throw new Error('Storage error: ' + error.message);
 }
 
 // ---- Auth: verify the Supabase access token sent by the board, then look
@@ -121,19 +131,20 @@ app.patch('/api/me', authenticate, async (req, res) => {
 });
 
 // ---- Notes ----
-app.get('/api/notes', authenticate, (req, res) => {
-  res.json(readJSON(NOTES_FILE, []));
+app.get('/api/notes', authenticate, async (req, res) => {
+  const { data, error } = await supabaseAdmin.from('notes').select('*').order('ts', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json((data || []).map(noteRowToApi));
 });
 
-app.post('/api/notes', authenticate, (req, res) => {
+app.post('/api/notes', authenticate, async (req, res) => {
   const { category, tag, message, attachmentPath, attachmentName } = req.body || {};
   if (!message || !CATEGORIES.includes(category)) {
     return res.status(400).json({ error: 'message and a valid category are required.' });
   }
-  const notes = readJSON(NOTES_FILE, []);
-  const note = {
+  const row = {
     id: 'n' + Date.now() + Math.random().toString(36).slice(2, 7),
-    authorId: req.user.id,
+    author_id: req.user.id,
     author: req.user.name, // taken from the logged-in profile, never typed in
     category,
     tag: tag || 'Note',
@@ -142,73 +153,69 @@ app.post('/api/notes', authenticate, (req, res) => {
     archived: false,
     likes: [],
     replies: [],
-    attachmentPath: attachmentPath || null,
-    attachmentName: attachmentName ? String(attachmentName).slice(0, 200) : null,
-    ts: new Date().toISOString()
+    attachment_path: attachmentPath || null,
+    attachment_name: attachmentName ? String(attachmentName).slice(0, 200) : null
   };
-  notes.push(note);
-  writeJSON(NOTES_FILE, notes);
-  res.status(201).json(note);
+  const { data, error } = await supabaseAdmin.from('notes').insert(row).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(noteRowToApi(data));
 });
 
 // Pinning and archiving are moderation actions — managers and admins only.
-app.patch('/api/notes/:id', authenticate, requireRole('manager'), (req, res) => {
-  const notes = readJSON(NOTES_FILE, []);
-  const note = notes.find(n => n.id === req.params.id);
-  if (!note) return res.status(404).json({ error: 'Note not found.' });
-  if (typeof req.body.pinned === 'boolean') {
-    note.pinned = req.body.pinned;
-  }
-  if (typeof req.body.archived === 'boolean') {
-    note.archived = req.body.archived;
-  }
-  writeJSON(NOTES_FILE, notes);
-  res.json(note);
+app.patch('/api/notes/:id', authenticate, requireRole('manager'), async (req, res) => {
+  const updates = {};
+  if (typeof req.body.pinned === 'boolean') updates.pinned = req.body.pinned;
+  if (typeof req.body.archived === 'boolean') updates.archived = req.body.archived;
+  if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'Nothing to update.' });
+
+  const { data, error } = await supabaseAdmin.from('notes').update(updates).eq('id', req.params.id).select().single();
+  if (error || !data) return res.status(404).json({ error: error ? error.message : 'Note not found.' });
+  res.json(noteRowToApi(data));
 });
 
 // Anyone signed in can like/unlike — a simple toggle, one like per person.
-app.post('/api/notes/:id/like', authenticate, (req, res) => {
-  const notes = readJSON(NOTES_FILE, []);
-  const note = notes.find(n => n.id === req.params.id);
-  if (!note) return res.status(404).json({ error: 'Note not found.' });
-  if (!Array.isArray(note.likes)) note.likes = [];
+app.post('/api/notes/:id/like', authenticate, async (req, res) => {
+  const { data: existing, error: fetchErr } = await supabaseAdmin.from('notes').select('likes').eq('id', req.params.id).single();
+  if (fetchErr || !existing) return res.status(404).json({ error: 'Note not found.' });
 
-  const idx = note.likes.indexOf(req.user.id);
-  if (idx === -1) note.likes.push(req.user.id);
-  else note.likes.splice(idx, 1);
+  let likes = existing.likes || [];
+  const idx = likes.indexOf(req.user.id);
+  if (idx === -1) likes.push(req.user.id);
+  else likes.splice(idx, 1);
 
-  writeJSON(NOTES_FILE, notes);
-  res.json(note);
+  const { data, error } = await supabaseAdmin.from('notes').update({ likes }).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(noteRowToApi(data));
 });
 
 // Anyone signed in can reply — same posting rule as notes themselves.
-app.post('/api/notes/:id/replies', authenticate, (req, res) => {
+app.post('/api/notes/:id/replies', authenticate, async (req, res) => {
   const { message } = req.body || {};
   if (!message || !message.trim()) return res.status(400).json({ error: 'A reply needs a message.' });
 
-  const notes = readJSON(NOTES_FILE, []);
-  const note = notes.find(n => n.id === req.params.id);
-  if (!note) return res.status(404).json({ error: 'Note not found.' });
-  if (!Array.isArray(note.replies)) note.replies = [];
+  const { data: existing, error: fetchErr } = await supabaseAdmin.from('notes').select('replies').eq('id', req.params.id).single();
+  if (fetchErr || !existing) return res.status(404).json({ error: 'Note not found.' });
 
-  const reply = {
+  const replies = existing.replies || [];
+  replies.push({
     id: 'r' + Date.now() + Math.random().toString(36).slice(2, 7),
     authorId: req.user.id,
     author: req.user.name,
     message: String(message).slice(0, 500),
     ts: new Date().toISOString()
-  };
-  note.replies.push(reply);
-  writeJSON(NOTES_FILE, notes);
-  res.status(201).json(note);
+  });
+
+  const { data, error } = await supabaseAdmin.from('notes').update({ replies }).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(noteRowToApi(data));
 });
 
 // Reply author can delete their own; managers/admins can delete anyone's.
-app.delete('/api/notes/:id/replies/:replyId', authenticate, (req, res) => {
-  const notes = readJSON(NOTES_FILE, []);
-  const note = notes.find(n => n.id === req.params.id);
-  if (!note) return res.status(404).json({ error: 'Note not found.' });
-  const reply = (note.replies || []).find(r => r.id === req.params.replyId);
+app.delete('/api/notes/:id/replies/:replyId', authenticate, async (req, res) => {
+  const { data: existing, error: fetchErr } = await supabaseAdmin.from('notes').select('replies').eq('id', req.params.id).single();
+  if (fetchErr || !existing) return res.status(404).json({ error: 'Note not found.' });
+
+  const reply = (existing.replies || []).find(r => r.id === req.params.replyId);
   if (!reply) return res.status(404).json({ error: 'Reply not found.' });
 
   const isOwnReply = reply.authorId === req.user.id;
@@ -217,43 +224,44 @@ app.delete('/api/notes/:id/replies/:replyId', authenticate, (req, res) => {
     return res.status(403).json({ error: 'You can only delete your own replies.' });
   }
 
-  note.replies = note.replies.filter(r => r.id !== req.params.replyId);
-  writeJSON(NOTES_FILE, notes);
-  res.json(note);
+  const replies = existing.replies.filter(r => r.id !== req.params.replyId);
+  const { data, error } = await supabaseAdmin.from('notes').update({ replies }).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(noteRowToApi(data));
 });
 
 // Staff can delete their own notes; managers/admins can delete anyone's.
 app.delete('/api/notes/:id', authenticate, async (req, res) => {
-  const notes = readJSON(NOTES_FILE, []);
-  const note = notes.find(n => n.id === req.params.id);
-  if (!note) return res.status(404).json({ error: 'Note not found.' });
+  const { data: note, error: fetchErr } = await supabaseAdmin.from('notes').select('*').eq('id', req.params.id).single();
+  if (fetchErr || !note) return res.status(404).json({ error: 'Note not found.' });
 
-  const isOwnNote = note.authorId === req.user.id;
+  const isOwnNote = note.author_id === req.user.id;
   const canModerate = (ROLE_RANK[req.user.role] || 0) >= ROLE_RANK.manager;
   if (!isOwnNote && !canModerate) {
     return res.status(403).json({ error: 'You can only delete your own notes.' });
   }
 
-  if (note.attachmentPath) {
-    await supabaseAdmin.storage.from(ATTACHMENTS_BUCKET).remove([note.attachmentPath]).catch(() => {});
+  if (note.attachment_path) {
+    await supabaseAdmin.storage.from(ATTACHMENTS_BUCKET).remove([note.attachment_path]).catch(() => {});
   }
 
-  writeJSON(NOTES_FILE, notes.filter(n => n.id !== req.params.id));
+  const { error } = await supabaseAdmin.from('notes').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
 // ---- Settings (board title only) — admin only to change ----
-app.get('/api/settings', authenticate, (req, res) => {
-  res.json(readJSON(SETTINGS_FILE, { boardTitle: '620 NOTES' }));
+app.get('/api/settings', authenticate, async (req, res) => {
+  res.json(await kvGet('settings', { boardTitle: '620 NOTES' }));
 });
 
-app.post('/api/settings', authenticate, requireRole('admin'), (req, res) => {
+app.post('/api/settings', authenticate, requireRole('admin'), async (req, res) => {
   const { boardTitle } = req.body || {};
-  const current = readJSON(SETTINGS_FILE, { boardTitle: '620 NOTES' });
+  const current = await kvGet('settings', { boardTitle: '620 NOTES' });
   const updated = {
     boardTitle: boardTitle !== undefined ? String(boardTitle).slice(0, 80) : current.boardTitle
   };
-  writeJSON(SETTINGS_FILE, updated);
+  await kvSet('settings', updated);
   res.json(updated);
 });
 
@@ -264,10 +272,10 @@ function todayStr() {
   return new Date().toLocaleDateString('en-CA', { timeZone: TZ });
 }
 
-function readReservations() {
-  const data = readJSON(RESERVATIONS_FILE, { date: todayStr(), reservations: [] });
+async function readReservations() {
+  const data = await kvGet('reservations', { date: todayStr(), reservations: [] });
   // Roll over to a fresh empty list as soon as a new day starts, whether or
-  // not anything else has touched the file yet.
+  // not anything else has touched this yet.
   if (data.date !== todayStr()) {
     return { date: todayStr(), reservations: [] };
   }
@@ -332,8 +340,8 @@ async function extractReservationsFromImage(imageBase64, mediaType) {
   return parsed;
 }
 
-app.get('/api/reservations', authenticate, (req, res) => {
-  res.json(readReservations());
+app.get('/api/reservations', authenticate, async (req, res) => {
+  res.json(await readReservations());
 });
 
 // Managers and admins only — each upload is a paid API call, so this stays
@@ -345,7 +353,7 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
   }
   try {
     const extracted = await extractReservationsFromImage(imageBase64, mediaType);
-    const current = readReservations();
+    const current = await readReservations();
     const withMeta = extracted.map(r => ({
       id: 'r' + Date.now() + Math.random().toString(36).slice(2, 7),
       time: r.time || '',
@@ -359,7 +367,7 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
     }));
     current.reservations = current.reservations.concat(withMeta);
     current.date = todayStr();
-    writeJSON(RESERVATIONS_FILE, current);
+    await kvSet('reservations', current);
     res.json(current);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -369,8 +377,8 @@ app.post('/api/reservations/upload', authenticate, requireRole('manager'), async
 // Any signed-in staff can correct or add details as they learn them through
 // the shift — this isn't gated to managers since it's just editing text,
 // not triggering a paid API call.
-app.patch('/api/reservations/:id', authenticate, (req, res) => {
-  const current = readReservations();
+app.patch('/api/reservations/:id', authenticate, async (req, res) => {
+  const current = await readReservations();
   const reservation = current.reservations.find(r => r.id === req.params.id);
   if (!reservation) return res.status(404).json({ error: 'Reservation not found (it may have rolled over to a new day).' });
 
@@ -379,13 +387,13 @@ app.patch('/api/reservations/:id', authenticate, (req, res) => {
     if (typeof req.body[field] === 'string') reservation[field] = req.body[field].slice(0, 300);
   });
 
-  writeJSON(RESERVATIONS_FILE, current);
+  await kvSet('reservations', current);
   res.json(reservation);
 });
 
-app.delete('/api/reservations', authenticate, requireRole('admin'), (req, res) => {
+app.delete('/api/reservations', authenticate, requireRole('admin'), async (req, res) => {
   const cleared = { date: todayStr(), reservations: [] };
-  writeJSON(RESERVATIONS_FILE, cleared);
+  await kvSet('reservations', cleared);
   res.json(cleared);
 });
 
@@ -393,16 +401,16 @@ app.delete('/api/reservations', authenticate, requireRole('admin'), (req, res) =
 // The board uploads the actual bytes straight to Supabase Storage from the
 // browser (using the signed-in user's own session) — this backend only
 // tracks the metadata, so large files never pass through this server.
-app.get('/api/files', authenticate, (req, res) => {
-  res.json(readJSON(SHARED_FILES_FILE, []));
+app.get('/api/files', authenticate, async (req, res) => {
+  res.json(await kvGet('shared_files', []));
 });
 
-app.post('/api/files', authenticate, (req, res) => {
+app.post('/api/files', authenticate, async (req, res) => {
   const { path: filePath, filename, size } = req.body || {};
   if (!filePath || !filename) {
     return res.status(400).json({ error: 'path and filename are required.' });
   }
-  const files = readJSON(SHARED_FILES_FILE, []);
+  const files = await kvGet('shared_files', []);
   const file = {
     id: 'f' + Date.now() + Math.random().toString(36).slice(2, 7),
     path: filePath,
@@ -413,13 +421,13 @@ app.post('/api/files', authenticate, (req, res) => {
     uploadedAt: new Date().toISOString()
   };
   files.push(file);
-  writeJSON(SHARED_FILES_FILE, files);
+  await kvSet('shared_files', files);
   res.status(201).json(file);
 });
 
 // Uploader can remove their own file; managers/admins can remove anyone's.
 app.delete('/api/files/:id', authenticate, async (req, res) => {
-  const files = readJSON(SHARED_FILES_FILE, []);
+  const files = await kvGet('shared_files', []);
   const file = files.find(f => f.id === req.params.id);
   if (!file) return res.status(404).json({ error: 'File not found.' });
 
@@ -430,7 +438,7 @@ app.delete('/api/files/:id', authenticate, async (req, res) => {
   }
 
   await supabaseAdmin.storage.from(ATTACHMENTS_BUCKET).remove([file.path]).catch(() => {});
-  writeJSON(SHARED_FILES_FILE, files.filter(f => f.id !== req.params.id));
+  await kvSet('shared_files', files.filter(f => f.id !== req.params.id));
   res.json({ ok: true });
 });
 
@@ -576,9 +584,15 @@ async function getNotificationRecipients() {
 }
 
 async function runDigest() {
-  const allNotes = readJSON(NOTES_FILE, []);
+  const { data: rows, error } = await supabaseAdmin.from('notes').select('*').order('ts', { ascending: true });
+  if (error) {
+    console.error('[digest] could not load notes:', error.message);
+    return { sent: [], failed: [] };
+  }
+  const allNotes = (rows || []).map(noteRowToApi);
   const activeNotes = allNotes.filter(n => !n.archived); // archived notes are done — they don't need to keep showing up nightly
-  const settings = readJSON(SETTINGS_FILE, { boardTitle: '620 NOTES' });
+
+  const settings = await kvGet('settings', { boardTitle: '620 NOTES' });
   const recipients = await getNotificationRecipients();
   const subject = `${settings.boardTitle} — Nightly Digest, ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
   const html = buildDigestHtml(activeNotes, settings.boardTitle);
@@ -595,12 +609,15 @@ async function runDigest() {
   }
 
   if (results.sent.length > 0 && CLEAR_AFTER_SEND) {
-    const archiveFile = path.join(DATA_DIR, `archive-${new Date().toISOString().slice(0, 10)}.json`);
-    writeJSON(archiveFile, allNotes);
     // Pinned and archived notes both survive the nightly clear — pinned
     // because they're still active and important, archived because they're
-    // a permanent record someone deliberately chose to keep.
-    writeJSON(NOTES_FILE, allNotes.filter(n => n.pinned || n.archived));
+    // a permanent record someone deliberately chose to keep. Everything
+    // else gets deleted from the database.
+    const idsToDelete = allNotes.filter(n => !n.pinned && !n.archived).map(n => n.id);
+    if (idsToDelete.length > 0) {
+      const { error: delError } = await supabaseAdmin.from('notes').delete().in('id', idsToDelete);
+      if (delError) console.error('[digest] could not clear old notes:', delError.message);
+    }
   }
 
   console.log(`[digest] sent to ${results.sent.length}, failed for ${results.failed.length}`);
@@ -625,4 +642,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`620 Notes backend running on port ${PORT}`);
   console.log(`Nightly digest scheduled: "${DIGEST_CRON}" (${TZ})`);
+  console.log(`Storage: Supabase Postgres (no local disk dependency)`);
 });
