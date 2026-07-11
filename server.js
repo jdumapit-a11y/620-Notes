@@ -265,27 +265,6 @@ app.post('/api/settings', authenticate, requireRole('admin'), async (req, res) =
   res.json(updated);
 });
 
-// ---- Nightly menu (a Shared Files entry designated to print alongside the
-// reservations sheet each night, hidden from the general Shared Files list) ----
-app.get('/api/nightly-menu', authenticate, async (req, res) => {
-  res.json(await kvGet('nightly_menu', null));
-});
-
-app.post('/api/nightly-menu', authenticate, requireRole('admin'), async (req, res) => {
-  const { fileId } = req.body || {};
-  if (!fileId) {
-    await kvSet('nightly_menu', null);
-    return res.json(null);
-  }
-  const files = await kvGet('shared_files', []);
-  const file = files.find(f => f.id === fileId);
-  if (!file) return res.status(404).json({ error: 'File not found.' });
-
-  const menuConfig = { fileId: file.id, path: file.path, filename: file.filename };
-  await kvSet('nightly_menu', menuConfig);
-  res.json(menuConfig);
-});
-
 // ---- Reservations (daily screenshot -> structured table) ----
 function todayStr() {
   // YYYY-MM-DD in the restaurant's own timezone, so "today" matches what
@@ -294,11 +273,12 @@ function todayStr() {
 }
 
 async function readReservations() {
-  const data = await kvGet('reservations', { date: todayStr(), reservations: [] });
+  const data = await kvGet('reservations', { date: todayStr(), reservations: [], menuImagePath: null });
   // Roll over to a fresh empty list as soon as a new day starts, whether or
-  // not anything else has touched this yet.
+  // not anything else has touched this yet. The menu screenshot resets too —
+  // it's a nightly thing, same as the reservations themselves.
   if (data.date !== todayStr()) {
-    return { date: todayStr(), reservations: [] };
+    return { date: todayStr(), reservations: [], menuImagePath: null };
   }
   return data;
 }
@@ -413,9 +393,20 @@ app.patch('/api/reservations/:id', authenticate, async (req, res) => {
 });
 
 app.delete('/api/reservations', authenticate, requireRole('admin'), async (req, res) => {
-  const cleared = { date: todayStr(), reservations: [] };
+  const cleared = { date: todayStr(), reservations: [], menuImagePath: null };
   await kvSet('reservations', cleared);
   res.json(cleared);
+});
+
+// Attaches (or clears) a menu screenshot that prints underneath tonight's
+// reservations sheet. The image itself is uploaded straight to Supabase
+// Storage from the browser — this just records which file to use.
+app.post('/api/reservations/menu-image', authenticate, requireRole('manager'), async (req, res) => {
+  const { path: imagePath } = req.body || {};
+  const current = await readReservations();
+  current.menuImagePath = imagePath || null;
+  await kvSet('reservations', current);
+  res.json(current);
 });
 
 // ---- Shared Files (general attachments area, separate from notes) ----
