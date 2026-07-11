@@ -273,12 +273,12 @@ function todayStr() {
 }
 
 async function readReservations() {
-  const data = await kvGet('reservations', { date: todayStr(), reservations: [], menuImagePath: null });
+  const data = await kvGet('reservations', { date: todayStr(), reservations: [], menuItems: [] });
   // Roll over to a fresh empty list as soon as a new day starts, whether or
-  // not anything else has touched this yet. The menu screenshot resets too —
-  // it's a nightly thing, same as the reservations themselves.
+  // not anything else has touched this yet. The menu resets too — it's a
+  // nightly thing, same as the reservations themselves.
   if (data.date !== todayStr()) {
-    return { date: todayStr(), reservations: [], menuImagePath: null };
+    return { date: todayStr(), reservations: [], menuItems: [] };
   }
   return data;
 }
@@ -341,6 +341,61 @@ async function extractReservationsFromImage(imageBase64, mediaType) {
   return parsed;
 }
 
+async function extractMenuFromImage(imageBase64, mediaType) {
+  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not configured on the backend.');
+
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: 3000,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
+          {
+            type: 'text',
+            text: 'Extract the menu text from this restaurant menu screenshot. ' +
+              'Return ONLY a JSON array, no prose, no markdown code fences. Each item: ' +
+              '{"section": string, "name": string, "description": string, "price": string}. ' +
+              '"section" is the menu heading it falls under (e.g. "Starters", "Entrees", "Desserts") — ' +
+              'use "" if the menu has no sections. ' +
+              '"description" is the ingredient/preparation text under the dish name, if any — use "" if none. ' +
+              '"price" is exactly as written (e.g. "$18", "24"), or "" if not visible. ' +
+              'IMPORTANT: if the screenshot shows the same menu content repeated more than once (duplicate ' +
+              'columns, a mirrored layout, or the image is literally two copies side by side), extract each ' +
+              'dish only ONCE — never return duplicate entries for the same item. ' +
+              'Return [] if no menu items are visible.'
+          }
+        ]
+      }]
+    })
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Vision request failed (${resp.status}): ${errText}`);
+  }
+
+  const data = await resp.json();
+  const textBlock = (data.content || []).find(b => b.type === 'text');
+  if (!textBlock) throw new Error('No text returned from the vision model.');
+
+  const cleaned = textBlock.text.trim()
+    .replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+
+  let parsed;
+  try { parsed = JSON.parse(cleaned); }
+  catch (e) { throw new Error('Could not read the menu from that image — try a clearer screenshot.'); }
+  if (!Array.isArray(parsed)) throw new Error('Unexpected response format from the vision model.');
+  return parsed;
+}
+
 app.get('/api/reservations', authenticate, async (req, res) => {
   res.json(await readReservations());
 });
@@ -393,20 +448,35 @@ app.patch('/api/reservations/:id', authenticate, async (req, res) => {
 });
 
 app.delete('/api/reservations', authenticate, requireRole('admin'), async (req, res) => {
-  const cleared = { date: todayStr(), reservations: [], menuImagePath: null };
+  const cleared = { date: todayStr(), reservations: [], menuItems: [] };
   await kvSet('reservations', cleared);
   res.json(cleared);
 });
 
-// Attaches (or clears) a menu screenshot that prints underneath tonight's
-// reservations sheet. The image itself is uploaded straight to Supabase
-// Storage from the browser — this just records which file to use.
-app.post('/api/reservations/menu-image', authenticate, requireRole('manager'), async (req, res) => {
-  const { path: imagePath } = req.body || {};
-  const current = await readReservations();
-  current.menuImagePath = imagePath || null;
-  await kvSet('reservations', current);
-  res.json(current);
+// Reads the menu from a screenshot (AI vision, same cost/permission model
+// as the reservations upload) and stores it as structured text so it can
+// print in the same clean format as the reservations sheet — not as a raw
+// image, which also sidesteps duplicate-column screenshot layouts entirely.
+app.post('/api/reservations/menu-upload', authenticate, requireRole('manager'), async (req, res) => {
+  const { imageBase64, mediaType } = req.body || {};
+  if (!imageBase64 || !mediaType) {
+    return res.status(400).json({ error: 'imageBase64 and mediaType are required.' });
+  }
+  try {
+    const extracted = await extractMenuFromImage(imageBase64, mediaType);
+    const current = await readReservations();
+    current.menuItems = extracted.map(item => ({
+      section: item.section || '',
+      name: item.name || '',
+      description: item.description || '',
+      price: item.price || ''
+    }));
+    current.date = todayStr();
+    await kvSet('reservations', current);
+    res.json(current);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ---- Shared Files (general attachments area, separate from notes) ----
